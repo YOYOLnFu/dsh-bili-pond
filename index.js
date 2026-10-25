@@ -32,6 +32,7 @@ import { WINDOWS, stateDirOf, readJson, writeJson, ensureHomeFiles, ensureCharte
 import { loginStart, loginPoll, saveCredential, renderQrPng } from './lib/login.mjs'
 import { ensureUv } from './lib/uvfetch.mjs'
 import { harvestReport, appendHistory, enrich, readHistory } from './lib/history.mjs'
+import { isBvid as isBvRef, readLikeEvents, appendLikeEvent, currentLike, countToday as countLikedToday, listForUi as likesForUi, describeFromHistory as describeLikeTarget } from './lib/likes.mjs'
 
 export const name = 'bili-pond'
 export const inject = ['webServer', 'tools', 'settings']
@@ -151,6 +152,21 @@ export const Config = !z ? undefined : z.object({
   guardEmoji: z.boolean().default(true).extra('volatile', true),
   /** 守护口径：想让小号怎么说话 / 什么不能答（拼进每一轮提示词） */
   guardTone: z.string().default('').extra('volatile', true),
+
+  /** 点赞：默认关 —— 点赞是拿你的号表态，装上插件不该自动开始点 */
+  likeOn: z.boolean().default(false).extra('volatile', true),
+  /** 每轮（= 一次跑一轮）最多赞几条 */
+  likePerRound: z.natural().default(1).extra('volatile', true),
+  /** 每天最多赞几条（硬顶 10：超过按 10 算，防止把额度开成无限） */
+  likePerDay: z.natural().default(3).extra('volatile', true),
+  /** 判据档位：strict=严格 / standard=标准 / loose=宽松 / custom=自定义（原文在 duty.md，这里只存档位） */
+  likeRule: z.string().default('standard').extra('volatile', true),
+  /** 自定义判据（likeRule=custom 时拼进提示词；≤300 字，别写成长篇） */
+  likeRuleExtra: z.string().default('').extra('volatile', true),
+  /** 收藏：默认关 */
+  favOn: z.boolean().default(false).extra('volatile', true),
+  /** 每天最多收藏几条（硬顶 8） */
+  favPerDay: z.natural().default(2).extra('volatile', true),
 
   /** 跑 headless 时的工作目录 */
   workspace: z.string().default('').extra('volatile', true),
@@ -336,6 +352,7 @@ const pondAccount = async () => {
     dmOn: false, dmMode: 'off', dmUid: 0,
     keywords: [], commentPerRound: 1, mentionName: '', mentionUid: 0, pythonPath: 'python', dshBin: '', headlessProfile: 'headless', dutyProvider: '', dutyModel: '', overlayMcp: true, reuseRoutes: true, workspace: '', reportLevel: 'full', replyToComments: false, replyPerRound: 1,
     guardOn: false, guardWhitelist: '', guardOwnAll: true, guardDailyCap: 30, guardScope: 1, guardPerRound: 3, guardPollMinutes: 3, guardEmoji: true, guardTone: '',
+    likeOn: false, likePerRound: 1, likePerDay: 3, likeRule: 'standard', likeRuleExtra: '', favOn: false, favPerDay: 2,
   }
   const normalize = (src, base) => {
     const out = { ...base }
@@ -432,6 +449,17 @@ const pondAccount = async () => {
       p.autoComment = false
       p.replyToComments = false
     }
+
+    /* ── 点赞 / 收藏（2026-10-25） ──
+     * 与评论不一样：**不跟挑中数互钳**。挑 3 条里点 1 条、挑 0 条也能点，两者没有必然关系。
+     * 只在写入时钉硬顶：likePerDay ≤ 10、favPerDay ≤ 8（引擎里还会再比一次，两处同源）。 */
+    if ('likeOn' in p) p.likeOn = Boolean(p.likeOn)
+    if ('favOn' in p) p.favOn = Boolean(p.favOn)
+    num('likePerRound', 0, 5, 1)
+    num('likePerDay', 0, 10, 3)
+    num('favPerDay', 0, 8, 2)
+    if ('likeRule' in p) p.likeRule = ['strict', 'standard', 'loose', 'custom'].includes(String(p.likeRule)) ? String(p.likeRule) : 'standard'
+    if ('likeRuleExtra' in p) p.likeRuleExtra = String(p.likeRuleExtra ?? '').slice(0, 300)
     return p
   }
 
@@ -671,6 +699,124 @@ const pondAccount = async () => {
 
   const hasCredential = () => existsSync(join(stateDir, 'bili_credential.json'))
 
+  /* ─────────────── 点赞 / 收藏（2026-10-25） ───────────────
+   * 三层边界（用户定的）：
+   *   ① 可设：开关（默认关）/ 每轮几条 / 每天几条 / 判据档位 / 自定义判据 / 收藏几条
+   *   ② 写死：没理由不许点（<6 字直接拒）· 每日硬顶（赞 10 / 收藏 8）· 撞风控停 30 分钟
+   *            · 只赞不投币（硬币不可逆）· 撤销只能撤自己点过的
+   *   ③ 不做：跟 commentPerRound 那种「评论上限不得超过挑中数」的互钳（点赞与挑几条无关）
+   * 额度口径：只数"真的点出去"的事件（like:true），撤销**不返还**额度 —— 否则赞了撤、撤了赞就能无限刷。
+   */
+  const LIKE_HARD_CAP = 10
+  const FAV_HARD_CAP = 8
+  const cooldownFile = join(stateDir, 'like-cooldown.json')
+  const cooldownNow = () => {
+    const j = readJson(cooldownFile, {})
+    return Number(j.until) > Date.now() ? j : null
+  }
+  const tripCooldown = (why) => {
+    try {
+      writeJson(cooldownFile, { until: Date.now() + 30 * 60 * 1000, why: String(why || '').slice(0, 200), at: new Date().toISOString() })
+    } catch { /* 记不下来也照样返回拒绝 */ }
+  }
+  // B站 对连点很敏感：撞上 -352/-412 就别接着点了，连带会扣号
+  const isRiskFailure = (msg) => /-352|-412|\b352\b|\b412\b|风控|risk/i.test(String(msg || ''))
+
+  // 每天上限 = min(硬顶, 用户设置) —— 与 clampPatch 的硬顶同源，两处都钉
+  const capOf = (kind) => Math.min(
+    kind === 'like' ? LIKE_HARD_CAP : FAV_HARD_CAP,
+    Math.max(0, Number(kind === 'like' ? cfg.likePerDay : cfg.favPerDay) || 0),
+  )
+  /* 「这一轮」= 本轮开始至今。没有进行中的轮次（比如面板手动点）就退回上一轮的开始时间；
+   * 一次都没跑过就退回 0（= 今天全天都算）。 */
+  const roundStartTs = () => {
+    const t0 = Number(dutyRun?.startedAt) || 0
+    if (t0 > 0) return t0
+    const iso = readJson(dutyStateFile, {}).lastRunAt
+    const t = iso ? Date.parse(iso) : 0
+    return Number.isFinite(t) ? t : 0
+  }
+
+  /**
+   * 点赞 / 收藏的唯一入口：工具调用与面板撤销都走这里，闸门只写一遍。
+   * 失败时返回**为什么没点**（给模型看的），不是一个干巴巴的错误码。
+   */
+  const interact = async (args, kind, by = 'duty', opts = {}) => {
+    const isLike = kind === 'like'
+    const verb = isLike ? '点赞' : '收藏'
+    const flag = isLike ? 'like' : 'fav'
+    const bvid = String(args?.bvid ?? '').trim()
+    const want = args?.[flag] === undefined ? true : args[flag] !== false
+    const reason = String(args?.reason ?? '').trim()
+    const on = Boolean(isLike ? cfg.likeOn : cfg.favOn)
+
+    if (!isBvRef(bvid)) return { ok: false, blocked: true, error: `bvid 不合法：${bvid || '(空)'}` }
+    // 撤销不受「开关关着」影响：用户点错了要能收回来
+    if (want && !on) {
+      return { ok: false, blocked: true, error: `「${verb}」在设置里是关着的（默认关）—— 要替这个号${verb}，得使用者自己去设置页打开。` }
+    }
+    if (want && reason.length < 6) {
+      return { ok: false, blocked: true, error: `${verb}必须带理由（≥6 个字）。写不出理由 ⇒ 这条不该点，跳过它。` }
+    }
+    if (!hasCredential()) return { ok: false, error: '还没登录 B站（去设置页扫码）' }
+
+    const cur = currentLike(stateDir, kind, bvid)
+    if (want && cur?.like) return { ok: true, bvid, [flag]: true, already: true, note: `${verb}过了（记账里有），没有重复请求` }
+    if (!want && !cur?.like) return { ok: false, blocked: true, error: `撤销失败：记账里没有这条${verb}记录（只能撤自己点过的）` }
+
+    const day = dayKey()
+    const cap = capOf(kind)
+    if (want) {
+      const used = countLikedToday(stateDir, kind, day)
+      if (cap > 0 && used >= cap) return { ok: false, blocked: true, error: `今天已经${verb} ${used} 条，到上限 ${cap} 了 —— 明天再说` }
+      if (isLike) {
+        const perRound = Math.max(0, Number(cfg.likePerRound) || 0)
+        /* 「每轮」只在**真有这一轮**的时候有意义：面板手动补跑（`roundStart: null`）没有轮次，
+         * 只看每天上限 —— 否则会拿上一轮的账来挡这一次（实测撞过：面板补跑被判「这一轮已经 3 条」）。 */
+        const from = opts?.roundStart === undefined ? roundStartTs() : opts.roundStart
+        if (perRound > 0 && from !== null) {
+          const inRound = countLikedToday(stateDir, kind, day, from)
+          if (inRound >= perRound) return { ok: false, blocked: true, error: `这一轮已经${verb} ${inRound} 条（每轮上限 ${perRound}）—— 留给下一轮` }
+        }
+      }
+      const cool = cooldownNow()
+      if (cool) return { ok: false, blocked: true, error: `刚撞过风控，先歇到 ${new Date(cool.until).toLocaleString('zh-CN')}（原因：${cool.why || '接口拒绝'}）` }
+    }
+
+    const raw = await call(isLike ? 'bili_like' : 'bili_fav', isLike ? { bvid, like: want } : { bvid, fav: want })
+    // MCP 一般回对象；万一回的是 JSON 字符串也认（别把「字符串里写着 ok:false」当成成功）
+    const r = typeof raw === 'string'
+      ? (() => { try { return JSON.parse(raw) } catch { return { ok: true, note: raw.slice(0, 200) } } })()
+      : (raw || {})
+    if (r.ok === false || r.error) {
+      const msg = String(r.error || r.reason || '接口没给结果')
+      /* 65006「重复点赞」= 服务端本来就是已赞（例如早先某一轮点过、但记账没落上）。
+       * 那不是失败：补一条记账，免得模型把「已经是赞了」当成错误反复重试。 */
+      if (/65006|重复点赞|已赞过|已经点过/.test(msg)) {
+        const meta = describeLikeTarget(stateDir, bvid, readHistory(stateDir))
+        appendLikeEvent(stateDir, { ts: Date.now(), day, kind, bvid, like: true, reason: `${reason}（服务端已是已赞，补记）`, ...meta, by })
+        return {
+          ok: true, bvid, [flag]: true, already: true,
+          note: '接口回「重复点赞」⇒ 服务端本来就是这个状态，已补记一条',
+          today: countLikedToday(stateDir, kind, day),
+          cap: cap || '不限',
+        }
+      }
+      if (isRiskFailure(msg)) tripCooldown(msg)
+      return { ok: false, error: `${verb}没成功：${msg}` }
+    }
+
+    const meta = describeLikeTarget(stateDir, bvid, readHistory(stateDir))
+    appendLikeEvent(stateDir, { ts: Date.now(), day, kind, bvid, like: want, reason, ...meta, by })
+    return {
+      ok: true, bvid, [flag]: want, reason,
+      today: countLikedToday(stateDir, kind, day),
+      cap: cap || '不限',
+      ...(r.folder ? { folder: r.folder } : {}),
+      ...(want ? {} : { undone: true }),
+    }
+  }
+
   /* ─────────────── 工具 ─────────────── */
 
   const textOutput = {
@@ -777,6 +923,33 @@ const pondAccount = async () => {
         rpid: Number(args.rpid) || 0,
       })
     },
+  })
+
+  tool({
+    name: 'bili_like',
+    description: '给一条视频**点赞**（`like: false` 则撤销）—— 真的点在这个号上，不是本地标记。\n'
+      + '🔴 默认关：设置里「点赞」没打开时一律拒绝。\n'
+      + '🔴 必须带 reason（≥6 字，写给本人看的"为什么值得赞"）：写不出理由 ⇒ 说明这条不该点。\n'
+      + '额度：每轮 / 每天各一档上限，到顶就拒（不排队、不攒着）。',
+    parameters: {
+      bvid: { type: 'string', description: 'BV号' },
+      reason: { type: 'string', description: '为什么赞这一条（≥6 字；会记进点赞记录，本人可查）' },
+      like: { type: 'boolean', description: 'true / 不填 = 点赞；false = 撤销' },
+    },
+    async execute(args) { return interact(args, 'like') },
+  })
+
+  tool({
+    name: 'bili_fav',
+    description: '把一条视频**收进默认收藏夹**（`fav: false` 则取消收藏）。\n'
+      + '🔴 默认关，且判据与点赞不同：收 = 「以后还会回来看」；赞 = 「这条对我有用」。\n'
+      + '🔴 必须带 reason（≥6 字，写清"什么情况下会翻回来看"）。',
+    parameters: {
+      bvid: { type: 'string', description: 'BV号' },
+      reason: { type: 'string', description: '什么情况下会回来看（≥6 字）' },
+      fav: { type: 'boolean', description: 'true / 不填 = 收藏；false = 取消' },
+    },
+    async execute(args) { return interact(args, 'fav') },
   })
 
   tool({
@@ -945,6 +1118,56 @@ const pondAccount = async () => {
   const roundsToday = (now = new Date()) => {
     const st = readJson(dutyStateFile, {})
     return st.day === dayKey(now) ? Number(st.count || 0) : 0
+  }
+
+  /* ⭐ 点赞 / 收藏改由**宿主在轮末执行**（2026-10-25 实测定下来的）：
+   *    值班轮的模型只看得到 MCP 白名单里的工具，**看不到宿主工具** ⇒ 它手里根本没有点赞接口
+   *    （它自己在报告里写过「当前可用工具列表未提供点赞接口」）。所以改成「它写一行、宿主来点」：
+   *    章程要求写成 `✅ 赞 · BV号 · 理由` / `⭐ 藏 · BV号 · 理由`，轮结束宿主解析这些行，
+   *    走 interact() 那唯一一道闸门（额度、去重、风控熔断、记账都在里面）。
+   *    好处：模型没有直接点按钮的权力，没写理由的行宿主不执行，账上每条都有出处。 */
+  const INTENT_LINE = /^[^\p{L}\p{N}]*[✅⭐★]?\s*(赞|藏)\s*[·:：\-—]\s*(BV[0-9A-Za-z]{8,14})\s*(?:[·:：\-—]\s*(.*))?$/u
+  const parseLikeIntents = (text) => {
+    const list = []
+    for (const raw of String(text || '').split(/\r?\n/)) {
+      const m = raw.trim().match(INTENT_LINE)
+      if (!m) continue
+      list.push({
+        kind: m[1] === '赞' ? 'like' : 'fav',
+        bvid: m[2],
+        reason: String(m[3] || '').trim(),
+      })
+    }
+    return list
+  }
+
+  /** 轮末把报告里的点赞/收藏意图真点出去；结果追回报告末尾（跟「评论复核」同构） */
+  let applyingIntents = false
+  const applyLikeIntents = async (why = 'round') => {
+    if (applyingIntents) return { ok: false, error: '上一次还在跑' }
+    if (!cfg.likeOn && !cfg.favOn) return { ok: true, skipped: '点赞 / 收藏都关着' }
+    let text = ''
+    try { text = readFileSync(reportFileOf(), 'utf8') } catch { return { ok: true, skipped: '今天还没有报告' } }
+    const intents = parseLikeIntents(text).filter((x) => (x.kind === 'like' ? cfg.likeOn : cfg.favOn))
+    if (!intents.length) return { ok: true, done: 0 }
+    applyingIntents = true
+    const lines = []
+    try {
+      for (const it of intents) {
+        const word = it.kind === 'like' ? '点赞' : '收藏'
+        const r = await interact({ bvid: it.bvid, reason: it.reason, like: true }, it.kind, why === 'panel' ? 'panel' : 'duty', why === 'panel' ? { roundStart: null } : {})
+        const note = r?.ok === false
+          ? `没成：${r.error || r.hint || '未知原因'}`
+          : (r?.already ? '本来就已经是了（没有重复请求）' : `已${word}`)
+        log(`轮末${word} ${it.bvid}（${why}）：${note}`)
+        lines.push(`- \`${it.bvid}\` ${note}${it.reason ? ` · 理由：${it.reason}` : ''}`)
+      }
+    } finally { applyingIntents = false }
+    try {
+      appendFileSync(reportFileOf(),
+        '\n\n---\n\n## 点赞 / 收藏复核（宿主自动跑的，不是那一轮自己点的）\n\n' + lines.join('\n') + '\n')
+    } catch (e) { log(`把点赞结果写回报告失败（不影响已经点出去的）：${e?.message ?? e}`) }
+    return { ok: true, done: lines.length }
   }
 
   // ⭐ 一键升级：由宿主自己跑 `dsh plugin --profile web add dsh-bili-pond`
@@ -1122,6 +1345,17 @@ const pondAccount = async () => {
     const circleOn = Boolean(cfg.circleMode)
     const commentOn = Boolean(!circleOn && cfg.autoComment && cfg.mentionName)
     const dmOn = Boolean(cfg.dmOn && Number(cfg.dmUid) > 0)
+    /* ⭐ 点赞 / 收藏（2026-10-25）：默认关；开着的才给额度，判据档位与 duty.md 里的原文对应 */
+    const likeOn = Boolean(cfg.likeOn)
+    const favOn = Boolean(cfg.favOn)
+    const likeCap = capOf('like')
+    const favCap = capOf('fav')
+    const likeUsed = countLikedToday(stateDir, 'like', dayKey())
+    const favUsed = countLikedToday(stateDir, 'fav', dayKey())
+    const rulePk = ['strict', 'standard', 'loose', 'custom'].includes(String(cfg.likeRule)) ? String(cfg.likeRule) : 'standard'
+    const ruleName = rulePk === 'custom' ? '自定义（以章程里的为准）' : ({ strict: '严格', standard: '标准', loose: '宽松' }[rulePk])
+    /* ⭐ 补充判据：档位之外还想强调的（用户自己写），必须原样送到模型眼前，否则他白填 */
+    const likeRuleExtra = String(cfg.likeRuleExtra || '').trim()
     /* ⭐ 第一行会变成会话列表里的标题（2026-10-22 用户：「值班轮也进对话，不是新建」） */
     return `值班：刷一轮 B站，挑值得我看的。\n\n`
       + `你是这个账号的 B站 助手。`
@@ -1219,6 +1453,22 @@ const pondAccount = async () => {
       + (!circleOn && cfg.replyToComments
         ? `回复评论：开着（每轮最多回 ${Number(cfg.replyPerRound) || 1} 条）—— 只回「直接回复到你那条评论下面的人」，回完记进报告；找不到你那条评论就跳过，别硬找。`
         : `回复评论：关着（一个字都不要回任何人 —— 有人回复你那条评论也不要理）。`)
+      /* ── 点赞 / 收藏：额度、档位与铁律（判据原文在章程里，免得两处各写一套） ── */
+      + ((likeOn || favOn)
+        ? `\n**点赞 / 收藏**（判据在章程里，这里是额度与铁律）：\n`
+          + (likeOn
+            ? `· 点赞：开着 —— 档位「${ruleName}」，每轮最多 ${Number(cfg.likePerRound) || 0} 条，今天已点 ${likeUsed}/${likeCap || '不限'}。`
+              + `🔴 **这一轮你没点赞工具**（工具列表里没有点赞接口，别去找）：要赞的，在报告里写一行 \`✅ 赞 · BV号 · 理由\`，`
+              + `理由 ≥6 字、写清"对使用者有什么用"；这一轮结束后**宿主替你点**，结果会追回报告末尾。没写这行的视频宿主不会点。`
+              + `写之前必须真的读过内容（bili_subtitle / bili_video_info）—— 没读过就写，等于让宿主替你瞎点。\n`
+              + (likeRuleExtra ? `· **他的补充判据（优先级高于档位）**：${likeRuleExtra}\n` : '')
+            : `· 点赞：关着（一条都不许点，也别写 \`✅ 赞\` 那行 —— 宿主会拒）。\n`)
+          + (favOn
+            ? `· 收藏：开着 —— 每天最多 ${favCap || '不限'} 条，今天已收 ${favUsed}。`
+              + `收的判据与赞不同：**收 = 以后还会回来看**；要收就写一行 \`⭐ 藏 · BV号 · 理由\`，理由写"什么情况下会翻回来"。\n`
+            : `· 收藏：关着。\n`)
+          + `🔴 铁律：没读过内容不许写那行；撤销只能撤自己点过的（撤销在面板里做，你同样没有这个工具）；撞风控就停，别连着试。\n`
+        : '')
       /* ── 守护评论区：这一轮的待回复清单（宿主扫好、内联进来） ── */
       + guardPromptPart()
       + `最后用一句话汇报你挑到了什么。现在几点了自己看一眼系统时间。`
@@ -1260,6 +1510,11 @@ const pondAccount = async () => {
     else if (cfg.autoComment || cfg.replyToComments) list.push('bili_reply')   // 只有真要发评论才给这只
     // ⭐ 私信：开关打开才给这只
     if (cfg.dmOn) list.push('bili_send_message')
+    /* ⛔ 点赞 / 收藏**绝不能**在这里放行（2026-10-25 实测踩到）：
+     *    MCP 那只 `bili_like` 没有理由闸门、没有额度、也不记账 ——
+     *    模型走了它，赞真的点出去了，但 `like-log.jsonl` 一个字没写 ⇒ 面板显示「今天 0 / 3」、
+     *    撤销也找不到记录（本轮报告里写着「✅ 赞 · BV…」，账上却是空的）。
+     *    ⇒ 点赞/收藏只走宿主那两只带闸门和记账的 `bili_like` / `bili_fav`，MCP 侧保持不注册。 */
     /* ⭐ 守护评论区（2026-10-22）：这一轮要「读内容 → 回一条」，所以三只都得给：
      *    bili_guard_scan（宿主已经扫过、把待回复清单内联进提示词了，但允许它自己补扫一次）
      *    bili_subtitle / bili_video_info（先看视频再说话，不许凭空编）
@@ -1745,6 +2000,8 @@ const pondAccount = async () => {
         log(`结束但没成功 · 用时 ${fmtDur(tookSec)} · ${fail.hint}`)
         bumpState({ lastError: { at: new Date().toISOString(), ...fail } })
       }
+      // ⭐ 轮末执行报告里的 `✅ 赞 · BV · 理由` / `⭐ 藏 · BV · 理由`（模型没有点赞工具，由宿主替它点）
+      Promise.resolve(applyLikeIntents('round')).catch((e) => log(`轮末点赞异常（不影响这一轮）：${e?.message ?? e}`))
       // ⭐ 发完评论之后**过一会儿再核一次**（2026-10-16 加的「评论发出后复核」）：
       //    接口回"发送成功"≠ 公开可见（新号/风控会进审核）；而"不公开"时连 @ 通知都不会推 ⇒
       //    插件会以为发了、下一轮不再发 ⇒ 一条都没到人。等 90 秒再查，避免把"还在审核"误判成"没发出去"。
@@ -3165,6 +3422,46 @@ const pondAccount = async () => {
 
     /* ⭐ 守护评论区（2026-10-22）：状态 + 手动扫一次。
      *    手动扫**只入队、不立刻开跑** —— 跑一轮要花模型额度，让使用者自己决定什么时候跑。 */
+    /* ⭐ 点赞 / 收藏记录（2026-10-25）：面板那边看"今天点了什么、还能点几条"，撤销也走这里 */
+    if (req.method === 'GET' && path === '/api/bili-pond/likes') {
+      const day = dayKey()
+      const ui = likesForUi(stateDir)
+      return sendJson(res, 200, {
+        ok: true,
+        home: stateDir,
+        today: day,
+        likeOn: Boolean(cfg.likeOn),
+        favOn: Boolean(cfg.favOn),
+        like: {
+          today: countLikedToday(stateDir, 'like', day),
+          perDay: capOf('like'),
+          perRound: Math.max(0, Number(cfg.likePerRound) || 0),
+          rule: String(cfg.likeRule || 'standard'),
+          items: ui.like,
+        },
+        fav: { today: countLikedToday(stateDir, 'fav', day), perDay: capOf('fav'), items: ui.fav },
+        cooldown: cooldownNow(),
+      })
+    }
+    if (req.method === 'POST' && path === '/api/bili-pond/likes/undo') {
+      try {
+        const body = await readBody(req)
+        const kind = String(body?.kind || 'like') === 'fav' ? 'fav' : 'like'
+        const bvid = String(body?.bvid || '').trim()
+        return sendJson(res, 200, await interact({ bvid, [kind]: false, reason: '面板撤销' }, kind, 'panel'))
+      } catch (e) {
+        return sendJson(res, 500, { ok: false, error: String(e?.message || e) })
+      }
+    }
+    /* ⭐ 手动执行今天报告里的 `✅ 赞` / `⭐ 藏` 行（轮末宿主本来就会自动跑一次；
+     *    这里给面板/我留一个不用等下一轮的入口，也是自测口径）。 */
+    if (req.method === 'POST' && path === '/api/bili-pond/likes/apply') {
+      try {
+        return sendJson(res, 200, await applyLikeIntents('panel'))
+      } catch (e) {
+        return sendJson(res, 500, { ok: false, error: String(e?.message || e) })
+      }
+    }
     if (req.method === 'GET' && path === '/api/bili-pond/guard') {
       const g = guardCfg()
       const st = readGuard()
@@ -3283,7 +3580,9 @@ const pondAccount = async () => {
         'minDurationMin', 'maxDurationMin', 'preferSubtitle', 'subtitleProbeMax',
         'keywords', 'pythonPath', 'dshBin', 'headlessProfile', 'dutyProvider', 'dutyModel', 'workspace', 'reportLevel', 'replyToComments', 'replyPerRound',
         // 2026-10-22 守护评论区（骑士团）
-        'guardOn', 'guardWhitelist', 'guardOwnAll', 'guardDailyCap', 'guardScope', 'guardPerRound', 'guardPollMinutes', 'guardEmoji', 'guardTone']) {
+        'guardOn', 'guardWhitelist', 'guardOwnAll', 'guardDailyCap', 'guardScope', 'guardPerRound', 'guardPollMinutes', 'guardEmoji', 'guardTone',
+        // 2026-10-25 点赞与收藏
+        'likeOn', 'likePerRound', 'likePerDay', 'likeRule', 'likeRuleExtra', 'favOn', 'favPerDay']) {
         if (k in body) patch[k] = body[k]
       }
       // ⭐ 范围钳制 + 两份都写（config.json / DSH 原生设置页），统一走 persistCfg —— 见文件上方

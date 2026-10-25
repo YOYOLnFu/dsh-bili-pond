@@ -1,7 +1,7 @@
 {
   "name": "dsh-bili-pond",
-  "version": "1.3.12",
-  "description": "蓝色大肥鱼替你看 B 站、写日报、记偏好和写日记；评论区支持守护与只接邀请的圈地自萌。自动运行和自动评论默认关闭。",
+  "version": "1.3.13",
+  "description": "蓝色大肥鱼替你看 B 站、写日报、记偏好和写日记；评论区支持守护与只接邀请的圈地自萌；点赞和收藏默认关闭且必须带理由。自动运行和自动评论默认关闭。",
   "keywords": [
     "dsh",
     "dsh-plugin",
@@ -79,7 +79,7 @@
     "registry": "https://registry.npmjs.org/"
   },
   "scripts": {
-    "check": "node --import ./tools/register.mjs selfcheck.mjs && node tools/_check-1016.mjs && node tools/test-migrate.mjs && node tools/test-comment-cap.mjs && node tools/test-reuse-routes.mjs && node tools/test-guard.mjs && node tools/test-guard-watermark.mjs && node tools/test-duty-workspace.mjs && node tools/test-history.mjs && node tools/test-pond-page.mjs && node tools/test-circle-config.mjs && python tools/test-circle.py",
+    "check": "node --import ./tools/register.mjs selfcheck.mjs && node tools/_check-1016.mjs && node tools/test-migrate.mjs && node tools/test-comment-cap.mjs && node tools/test-reuse-routes.mjs && node tools/test-guard.mjs && node tools/test-guard-watermark.mjs && node tools/test-duty-workspace.mjs && node tools/test-history.mjs && node tools/test-pond-page.mjs && node tools/test-circle-config.mjs && node tools/test-intent-lines.mjs && node tools/test-likes.mjs && python tools/test-circle.py",
     "prepublishOnly": "npm run check"
   },
   "author": {

@@ -19,6 +19,9 @@ B站数据采集 MCP 服务，支持 OpenClaw / Claude Code / Cursor / Cline
 #      ⑦ 新增 `bili_guard_scan`：@ 通道 + 指定视频新评论的增量扫描，一次给全值班轮要的字段
 #      ⑧ `_guard_log()` + `bili_reply` 落记录：真发出去的回复写进 `BILI_GUARD_LOG`（jsonl），
 #         给界面「守护记录」用 —— 模型的自我汇报不能当证据，这一层才知道成没成
+#      ⑨ 新增 `bili_like` / `bili_fav`：Video 只给了 like/has_liked，收藏得走原始 HTTP（`_bili_api`）
+#      ⑩ `_comment_state()` 单查评论存活：`bili_reply` 发送前、`bili_circle_reply` 找不到目标时用它分清
+#         「已删」和「掉出前 100 条窗口」，不再把两种原因混成一句话
 import asyncio
 import json
 import base64
@@ -93,6 +96,72 @@ def get_cred() -> Credential:
     if not cred:
         raise Exception("未登录B站！请先调用 bili_login 工具获取登录二维码，让用户扫码登录。")
     return cred
+
+
+# ========== 原始 HTTP：SDK 没有的能力（收藏、单条评论核对） ==========
+
+_BILI_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+
+
+_RISK_CODES = (-352, -412, -799, -509)  # 连点/风控常见码，宿主靠文案里的 code 熔断
+
+
+def _risk_text(code, msg: str = "") -> str:
+    """code + message 一行；风控码额外带「风控」二字，宿主要靠它停 30 分钟。"""
+    code = int(code or 0)
+    return f"{'风控拦截 ' if code in _RISK_CODES else ''}code={code} {msg or ''}".strip()
+
+
+def _brief_error(e: Exception) -> str:
+    """异常压成一行短文案：模型要的是「为什么没成」，不是栈。"""
+    code = getattr(e, "code", None)
+    if code is None:
+        return f"{type(e).__name__}: {e}"
+    return _risk_text(code, getattr(e, "msg", "") or str(e))
+
+
+def _norm_bvid(bvid: str) -> str:
+    """统一成 BV 开头再去打接口：粘贴带来的空格、小写前缀都忍，不像 BV 号就回空串。"""
+    v = re.sub(r"\s+", "", str(bvid or ""))
+    return "BV" + v[2:] if re.match(r"(?i)^bv[0-9a-z]{10}$", v) else ""
+
+
+async def _bili_api(method: str, url: str, cred: Credential, params: dict = None, data: dict = None) -> dict:
+    """带登录态打 B站 web 接口（cookie 直接取 cred.get_cookies()，csrf 由调用方填 bili_jct）。"""
+    import aiohttp
+    async with aiohttp.ClientSession() as sess:
+        async with sess.request(
+            method, url,
+            params=params, data=data,
+            headers={"User-Agent": _BILI_UA, "Referer": "https://www.bilibili.com/"},
+            cookies=cred.get_cookies(),
+            timeout=aiohttp.ClientTimeout(total=15),
+        ) as resp:
+            try:
+                return await resp.json(content_type=None)
+            except Exception:
+                return {"code": -1, "message": f"HTTP {resp.status} 返回非 JSON"}
+
+
+async def _comment_state(rpid: int, aid: int, cred: Credential) -> str:
+    """单查一条评论还在不在，返回 gone / exists / unknown。
+
+    x/v2/reply/reply 传 root=rpid：一级评论回它自己，楼中楼回它所在的楼 ——
+    所以 exists 只证明「这一楼还在」，删子评论不会报 12006，不能反证那条楼中楼还在。
+    """
+    try:
+        resp = await _bili_api("GET", "https://api.bilibili.com/x/v2/reply/reply", cred,
+                               params={"type": 1, "oid": int(aid), "root": int(rpid), "pn": 1, "ps": 1})
+    except Exception:
+        return "unknown"
+    data = resp.get("data") if isinstance(resp.get("data"), dict) else {}
+    root = data.get("root") if isinstance(data.get("root"), dict) else {}
+    if resp.get("code") == 0 and int(root.get("rpid") or 0) > 0:
+        return "exists"
+    if resp.get("code") == 12006:  # 接口原文：没有该评论
+        return "gone"
+    return "unknown"
 
 
 # ========== Tool: 扫码登录（生成二维码） ==========
@@ -579,7 +648,17 @@ async def bili_circle_reply(bvid: str, rpid: int, text: str) -> str:
                     data = data2
                 break
     if found is None:
-        return json.dumps({"success": False, "error": "没在前 100 条一级评论里找到目标，按安全闸拒绝"}, ensure_ascii=False)
+        # 两种原因要分开：删了（重试无用）vs 掉出前 100 条窗口（评论可能还在）。
+        try:
+            state = await _comment_state(target, int(data.get("aid") or 0), get_cred())
+        except Exception:
+            state = "unknown"
+        if state == "gone":
+            return json.dumps({"success": False, "reason": "gone",
+                               "error": "目标评论已不存在（可能已被删除），未发送"}, ensure_ascii=False)
+        out_err = ("目标评论在，但不在前 100 条一级评论窗口里，未发送" if state == "exists"
+                   else "目标评论不在前 100 条一级评论窗口里，存活状态未能确认，未发送")
+        return json.dumps({"success": False, "reason": "out-of-window", "error": out_err}, ensure_ascii=False)
     if int(found.get("mid") or 0) != int(data.get("owner_mid") or 0) or int(data.get("owner_mid") or 0) <= 0:
         return json.dumps({"success": False, "error": "目标评论不是视频 UP 主本人发的，拒绝"}, ensure_ascii=False)
     ok, why = _circle_invite_match(found.get("content", ""))
@@ -744,6 +823,89 @@ async def bili_video_info(bvid: str) -> str:
     }, ensure_ascii=False)
 
 
+# ========== 点赞 / 收藏（Video 只有 like，收藏 SDK 没给，得自己打接口） ==========
+
+@tool()
+async def bili_like(bvid: str, like: bool = True) -> str:
+    """给视频点赞 / 取消点赞（用登录的那个号）。
+
+    Args:
+        bvid: 视频BV号
+        like: True 点赞，False 取消点赞（真去接口取消，不只是改本地状态）
+
+    Returns:
+        {"ok", "bvid", "like", "has_liked"}；has_liked 是发完再查一次的真实状态
+    """
+    bv = _norm_bvid(bvid)
+    if not bv:
+        return json.dumps({"ok": False, "error": f"不是 BV 号：{bvid}"}, ensure_ascii=False)
+    cred = load_credential()
+    if not cred or not cred.sessdata or not cred.bili_jct:
+        return json.dumps({"ok": False, "error": "还没登录 B站（去设置页扫码登录）"}, ensure_ascii=False)
+    try:
+        v = video.Video(bvid=bv, credential=cred)
+        await v.like(status=bool(like))
+        has = await v.has_liked()
+        return json.dumps({"ok": True, "bvid": bv, "like": bool(like), "has_liked": bool(has)}, ensure_ascii=False)
+    except Exception as e:
+        return json.dumps({"ok": False, "error": _brief_error(e)}, ensure_ascii=False)
+
+
+@tool()
+async def bili_fav(bvid: str, fav: bool = True, media_id: int | None = None) -> str:
+    """收藏 / 取消收藏视频；不给 media_id 就进默认收藏夹。
+
+    Args:
+        bvid: 视频BV号
+        fav: True 收藏，False 取消收藏（真发 del_medias）
+        media_id: 目标收藏夹 id，None 表示默认收藏夹
+
+    Returns:
+        {"ok", "bvid", "fav", "media_id", "folder"}
+    """
+    bv = _norm_bvid(bvid)
+    if not bv:
+        return json.dumps({"ok": False, "error": f"不是 BV 号：{bvid}"}, ensure_ascii=False)
+    cred = load_credential()
+    if not cred or not cred.sessdata or not cred.bili_jct:
+        return json.dumps({"ok": False, "error": "还没登录 B站（去设置页扫码登录）"}, ensure_ascii=False)
+    try:
+        v = video.Video(bvid=bv, credential=cred)
+        aid = int(v.get_aid() or 0)  # bvid 构造时就地算出 aid，不用再请求一次视频信息
+        if aid <= 0:
+            return json.dumps({"ok": False, "error": "拿不到该视频的 aid"}, ensure_ascii=False)
+
+        nav = await _bili_api("GET", "https://api.bilibili.com/x/web-interface/nav", cred)
+        if nav.get("code") != 0:
+            return json.dumps({"ok": False, "error": _risk_text(nav.get("code"), nav.get("message"))}, ensure_ascii=False)
+        mid = int((nav.get("data") or {}).get("mid") or 0)
+        folders = await _bili_api("GET", "https://api.bilibili.com/x/v3/fav/folder/created/list-all",
+                                  cred, params={"up_mid": mid})
+        items = ((folders.get("data") or {}).get("list") or []) if folders.get("code") == 0 else []
+        # 顺手把收藏夹名字带回去：界面要显示「进了哪个夹」，只给 id 人看不懂。
+        target = int(media_id or 0)
+        folder = ""
+        pick = next((it for it in items if int(it.get("id") or 0) == target), None) if target else (items[0] if items else None)
+        if pick:
+            target = int(pick.get("id") or 0)
+            folder = str(pick.get("title") or "")
+        if target <= 0:
+            return json.dumps({"ok": False,
+                               "error": _risk_text(folders.get("code"), folders.get("message") or "没找到默认收藏夹")},
+                              ensure_ascii=False)
+
+        field = "add_medias" if fav else "del_medias"
+        resp = await _bili_api("POST", "https://api.bilibili.com/x/v3/fav/resource/deal", cred,
+                               data={"rid": aid, "type": 2, field: target, "csrf": cred.bili_jct})
+        if resp.get("code") != 0:
+            return json.dumps({"ok": False, "error": _risk_text(resp.get("code"), resp.get("message"))},
+                              ensure_ascii=False)
+        return json.dumps({"ok": True, "bvid": bv, "fav": bool(fav), "media_id": target,
+                           "folder": folder or f"收藏夹 {target}"}, ensure_ascii=False)
+    except Exception as e:
+        return json.dumps({"ok": False, "error": _brief_error(e)}, ensure_ascii=False)
+
+
 # ========== Tool 6: 回复评论 ==========
 
 def _guard_log(entry: dict) -> None:
@@ -790,6 +952,12 @@ async def bili_reply(bvid: str, text: str, rpid: int = 0, root: int = 0) -> str:
     v = video.Video(bvid=bvid, credential=cred)
     info = await v.get_info()
     aid = info["aid"]
+
+    if rpid > 0:
+        # 目标评论已被删还硬发，只会换回一个看不懂的风控报错；先单查一次再决定发不发。
+        state = await _comment_state(int(rpid), int(aid), cred)
+        if state == "gone":
+            return json.dumps({"success": False, "error": "目标评论已不存在（可能已被删除），未发送"}, ensure_ascii=False)
 
     try:
         if rpid == 0:

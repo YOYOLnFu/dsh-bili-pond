@@ -106,6 +106,8 @@ window.__ModuleLoader__.load({
   border:1px solid var(--bd-line);border-radius:10px;overflow:hidden;
   background:var(--bd-surface);
 }
+/* 点赞 / 收藏这类格数不定的小指标：有几格就铺几格，关掉的那项不留半行空格 */
+[data-bd-metrics][data-bd-auto]{grid-template-columns:repeat(auto-fit,minmax(min(100%,200px),1fr));}
 [data-bd-metric]{padding:11px 16px 12px;min-width:0;}
 [data-bd-metric] + [data-bd-metric]{border-left:1px solid var(--bd-line);}
 [data-bd-metric-label]{
@@ -155,7 +157,16 @@ window.__ModuleLoader__.load({
 [data-bd-row-ctl]{flex:0 1 auto;display:flex;align-items:center;justify-content:flex-end;flex-wrap:wrap;gap:8px;max-width:100%;margin-left:auto;}
 [data-bd-row-ctl] > *{max-width:100%;}
 [data-bd-row][data-bd-stack]{flex-direction:column;align-items:stretch;gap:8px;}
+/* ⚠️ 纵向堆叠时 flex-basis 变成**高度**：上一条 base 规则的 flex:1 1 220px 会让标签块
+ *    先占 220px 高（grow 还会再撑），输入框被顶到行底部 —— 2026-10-25 实测截图就是这个大空隙。
+ *    ⇒ 堆叠行里两个子块都改成「按内容高度」，不参与伸缩。 */
+[data-bd-row][data-bd-stack] > [data-bd-row-main]{flex:0 0 auto;}
+/* ⚠️ 堆叠行的控件区改成整宽左对齐：base 那条 justify-content:flex-end 会让
+ *    「输入框 + 按钮」这一组被推到右边、还在窄处挤成两行（工作区路径就是这样，2026-10-25 实测）。
+ *    ⇒ 整宽、左起、不换行；输入框自己 flex:1 吃掉剩余宽度，「建模板」贴在它右边。 */
+[data-bd-row][data-bd-stack] > [data-bd-row-ctl]{flex:0 0 auto;width:100%;justify-content:flex-start;}
 [data-bd-row][data-bd-stack] [data-bd-row-ctl]{width:100%;}
+[data-bd-row][data-bd-stack] [data-bd-inline]{width:100%;justify-content:flex-start;flex-wrap:nowrap;}
 
 /* 级联子项：左侧竖线内缩 */
 [data-bd-sub]{padding-left:14px;border-left:2px solid var(--bd-line-2);margin:2px 0 6px;}
@@ -376,6 +387,40 @@ window.__ModuleLoader__.load({
 [data-bd-foot] a:hover{color:var(--bd-accent);text-decoration:underline;}
 [data-bd-foot] [data-bd-foot-sep]{color:var(--bd-line-2);padding:0 6px;}
 
+/* ══ 紧凑排版（2026-10-25）═════════════════════════════════════════════
+ * 设置页原来一行占 ~60px：标签 19 + 说明独占一行 18 + 上下 padding 20。
+ * 卡片从横向省不出来，只能从「行内」省：
+ *   ① 短说明并到标签同一行（[data-bd-row-hint]），只有真需要解释的说明才留第二行；
+ *   ② 相邻的同一类小项两列并排（[data-bd-pair]，如「每轮 / 每天」）；
+ *   ③ 行内 padding 10 → 6，卡头 11 → 9。
+ * ⚠️ 只调间距与排布，不改任何字段语义；窄屏（<620px）自动退回单列。
+ * ─────────────────────────────────────────────────────────────────── */
+[data-bd-row]{padding:6px 0;min-height:38px;gap:14px 12px;}
+[data-bd-row-hint]{margin-left:8px;font-size:12px;font-weight:400;color:var(--bd-fg-3);}
+[data-bd-row][data-bd-stack]{padding:8px 0;}
+
+/* 两列并排：整行自己画分隔线，里面两行不画（否则会多出一条横线） */
+[data-bd-pair]{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:0 22px;}
+[data-bd-pair] > [data-bd-row]{border-top:0;}
+[data-bd-row] + [data-bd-pair],
+[data-bd-pair] + [data-bd-row]{border-top:1px solid var(--bd-line);}
+[data-bd-sub] > [data-bd-pair]:first-child,
+[data-bd-card-body] > [data-bd-pair]:first-child{border-top:0;}
+
+[data-bd-card-body]{padding:4px 16px 6px;}
+[data-bd-card-head]{padding:9px 16px;}
+
+/* 指标栏：有几格铺几格（今天 / 环境 / 状态 / 点赞 / 收藏 一行放得下） */
+[data-bd-metrics]{grid-template-columns:repeat(auto-fit,minmax(min(100%,112px),1fr));}
+[data-bd-metric]{padding:9px 14px 10px;}
+
+/* 中号控件不再写死 230px：按内容宽度走，免得选项文字被截断成「普通评论 —— 在选中的…」 */
+[data-bd-w-md]{width:auto;min-width:170px;max-width:100%;}
+
+@media (max-width:620px){
+  [data-bd-pair]{grid-template-columns:minmax(0,1fr);gap:0;}
+}
+
 /* ══ 窄屏 ═══════════════════════════════════════════════════════════════ */
 @media (max-width:560px){
   [data-bd-metrics]{grid-template-columns:1fr 1fr;}
@@ -421,28 +466,42 @@ window.__ModuleLoader__.load({
       }, h('i'))
     }
 
+    /**
+     * 标签区：`hint` 并到标签同一行（灰、12px），`desc` 才是独占第二行的那句。
+     * ⭐ 2026-10-25：设置页一行原来固定 ~60px 高，一半是「说明独占一行」撑出来的。
+     *    短说明（「0 = 不限」「硬顶 10」这种）改走 hint，行高落到 ~38px。
+     */
+    function rowLabel(label, hint, desc) {
+      return h('div', { 'data-bd-row-main': '' },
+        h('div', { 'data-bd-row-label': '' },
+          label,
+          hint ? h('span', { 'data-bd-row-hint': '' }, ` · ${hint}`) : null),
+        desc ? h('div', { 'data-bd-row-desc': '' }, desc) : null)
+    }
+
     /** 一行：左标签/说明，右控件 */
-    function Row({ label, desc, children }) {
+    function Row({ label, desc, hint, children }) {
       return h('div', { 'data-bd-row': '' },
-        h('div', { 'data-bd-row-main': '' },
-          h('div', { 'data-bd-row-label': '' }, label),
-          desc ? h('div', { 'data-bd-row-desc': '' }, desc) : null),
+        rowLabel(label, hint, desc),
         children ? h('div', { 'data-bd-row-ctl': '' }, children) : null)
     }
 
     /** 一行：开关型 */
-    function SwitchRow({ label, desc, on, onChange, disabled }) {
-      return h(Row, { label, desc },
+    function SwitchRow({ label, desc, hint, on, onChange, disabled }) {
+      return h(Row, { label, desc, hint },
         h(Switch, { on, onChange, disabled }))
     }
 
     /** 一行：长控件占满（textarea / 日志等） */
-    function StackRow({ label, desc, children }) {
+    function StackRow({ label, desc, hint, children }) {
       return h('div', { 'data-bd-row': '', 'data-bd-stack': '' },
-        (label || desc) ? h('div', { 'data-bd-row-main': '' },
-          label ? h('div', { 'data-bd-row-label': '' }, label) : null,
-          desc ? h('div', { 'data-bd-row-desc': '' }, desc) : null) : null,
+        (label || hint || desc) ? rowLabel(label, hint, desc) : null,
         h('div', { 'data-bd-row-ctl': '' }, children))
+    }
+
+    /** 两列并排：把「每轮 X / 每天 Y」这种成对的短行合成一行 */
+    function Pair({ children }) {
+      return h('div', { 'data-bd-pair': '' }, children)
     }
 
     /** 分组分隔线（高级设置里把几组分开用，不是空 div 拼的） */
@@ -701,6 +760,13 @@ window.__ModuleLoader__.load({
       const [guardTone, setGuardTone] = React.useState(null)      // 守护口径：怎么说话
       const [guardLog, setGuardLog] = React.useState(null)        // 守护记录（最近 50 条）
       const [guardLogBusy, setGuardLogBusy] = React.useState(false)
+      /* 点赞与收藏：数字/文本项同样绑本地草稿（/status 5 秒轮询会冲掉直接绑 cfg 的值） */
+      const [likePerRound, setLikePerRound] = React.useState(null)   // 每轮最多赞几条
+      const [likePerDay, setLikePerDay] = React.useState(null)       // 每天最多赞几条
+      const [likeRule, setLikeRule] = React.useState(null)           // 判据档位：strict/standard/loose
+      const [likeRuleExtra, setLikeRuleExtra] = React.useState(null) // 补充判据（自由文本）
+      const [favPerDay, setFavPerDay] = React.useState(null)         // 每天最多收藏几条
+      const [likes, setLikes] = React.useState(null)                 // GET /likes：今日计数 + 明细
       const [autoRun, setAutoRun] = React.useState(null)
       const [runsPerDay, setRunsPerDay] = React.useState(null)
       const [gapMin, setGapMin] = React.useState(null)
@@ -814,6 +880,11 @@ window.__ModuleLoader__.load({
         if (cfg && maxDur === null) setMaxDur(String(cfg.maxDurationMin ?? 60))
         if (cfg && preferSub === null) setPreferSub(cfg.preferSubtitle !== false)
         if (cfg && probeMax === null) setProbeMax(String(cfg.subtitleProbeMax ?? 3))
+        if (cfg && likePerRound === null) setLikePerRound(String(cfg.likePerRound ?? 1))
+        if (cfg && likePerDay === null) setLikePerDay(String(cfg.likePerDay ?? 3))
+        if (cfg && likeRule === null) setLikeRule(String(cfg.likeRule ?? 'standard'))
+        if (cfg && likeRuleExtra === null) setLikeRuleExtra(String(cfg.likeRuleExtra ?? ''))
+        if (cfg && favPerDay === null) setFavPerDay(String(cfg.favPerDay ?? 2))
       }, [cfg])
 
       /* ⭐ 守护记录（2026-10-22）：自动拿号说话，必须能事后核对。
@@ -827,6 +898,17 @@ window.__ModuleLoader__.load({
         if (guardOn) { loadGuardLog() } else { setGuardLog(null) }
         // eslint-disable-next-line react-hooks/exhaustive-deps
       }, [guardOn])
+
+      /* 今日点赞 / 收藏计数：跟 /status 同频（5 秒）拉一次 —— 指标栏和历史页共用这一份口径 */
+      React.useEffect(() => {
+        let on = true
+        const pull = async () => {
+          try { const d = await jget('/likes'); if (on && d && d.ok) setLikes(d) } catch { /* 网络抖一下就下次再问 */ }
+        }
+        pull()
+        const t = setInterval(pull, 5000)
+        return () => { on = false; clearInterval(t) }
+      }, [])
 
       /* 守护记录列表：三种行 —— scan（扫了一次）/ queue（派出去回）/ reply（真发出去了） */
       const renderGuardLog = () => {
@@ -1092,10 +1174,7 @@ window.__ModuleLoader__.load({
         finally { setDmBusy(false) }
       }
 
-      const onSaveText = async () => {
-        const list = String(kws || '').split('\n').map((s) => s.trim()).filter(Boolean)
-        await patch({ keywords: list, workspace: String(ws || '').trim() }, '检索关键词与工作区')
-      }
+      /* 检索关键词改失焦即存（`client.js` 里那个 textarea 的 onBlur），原来的 onSaveText 已删掉。 */
 
       /* ⭐ 「建模板」：不知道 AGENTS.md 该写什么格式 ⇒ 让插件在工作区里铺一份能直接改的骨架 */
       const onAgentsTemplate = async () => {
@@ -1157,6 +1236,55 @@ window.__ModuleLoader__.load({
             ? '评论 + 私信'
             : (commentActive ? '只发公开评论' : '只发私信')))
 
+      /* 点赞判据档位：选项里带一句人话，选中态再在行说明里复述一遍（跟「评论模式」同一个写法） */
+      const LIKE_RULE_DESC = {
+        strict: '严格：只赞「有实操细节、本周用得上」的，宁可不赞',
+        standard: '标准：默认档，三条硬证据占两条才赞',
+        loose: '宽松：有点意思就赞，但仍受额度限制',
+      }
+
+      /* ⭐ 2026-10-25：原生设置页（头像 → 设置 → B站鱼塘）只留「运行环境 + 安装日志」。
+       *    理由：那屏是「一开始把它配起来」的地方；参数调优每天都在鱼塘大页里做，
+       *    两处都铺一份全量设置 ⇒ 双份 /status 轮询 + 两份草稿互相冲掉。
+       *    想改任何一项去鱼塘大页的「设置」tab（同一个组件，layout='embedded' 那条分支）。 */
+      if (layout === 'summary') {
+        const ready = st.venvReady
+        const stateTxt = ready
+          ? (st.loggedIn ? '就绪' : '待登录')
+          : (st.installing ? '安装中' : (st.installFailed ? '上次安装失败' : '待安装'))
+        return h('div', { 'data-bd-page': '', 'data-bd-layout': 'settings' },
+          h(Card, {
+            title: '运行环境',
+            desc: '装好依赖 + 扫码登录一次就能用；其余设置都在鱼塘大页里',
+          },
+            h(StackRow, { label: '状态', hint: stateTxt },
+              h('div', { 'data-bd-btns': '' },
+                h('button', { 'data-bd-btn': '', disabled: busy === 'install', onClick: onInstall },
+                  ready ? '重装依赖' : '安装运行环境'),
+                h('button', { 'data-bd-btn': '', disabled: busy === 'check', onClick: onCheck }, '连通性检测'),
+                h('button', { 'data-bd-btn': '', disabled: busy === 'login', onClick: onLoginStart }, '扫码登录'),
+                h('button', { 'data-bd-btn': '', 'data-primary': '', onClick: () => openPond(POND_ID) }, '打开鱼塘'))),
+            loginState ? h('div', {
+              'data-bd-msg': '', 'data-bd-msg-gap': '',
+              'data-good': loginTone === 'good' ? '' : undefined,
+              'data-warn': loginTone === 'warn' ? '' : undefined,
+            }, loginState) : null,
+            login?.qr ? h('div', { 'data-bd-qr': '' },
+              h('img', { src: login.qr, alt: 'B站登录二维码' }),
+              h('div', { 'data-bd-qr-note': '' },
+                '手机 B站 → 我的 → 扫一扫。',
+                h('br'),
+                '确认时请选择「记住我 / 长期」；选择 24 小时则次日需重新扫码。')) : null,
+            h(LogFold, {
+              label: st.installing ? '安装进度' : '安装日志',
+              desc: st.installing ? '' : '（末尾 1400 字）',
+              text: st.installTail,
+              open: logOpen,
+              onToggle: () => setLogOpen((v) => !v),
+            })),
+        )
+      }
+
       return h('div', { 'data-bd-page': '', 'data-bd-layout': layout },
 
         /* ══ ① 指标栏 ══════════════════════════════════════════════════ */
@@ -1173,7 +1301,19 @@ window.__ModuleLoader__.load({
             value: st.venvReady ? (st.loggedIn ? '就绪' : '待登录') : (st.installing ? '安装中' : '待安装'),
             tone: st.venvReady ? (st.loggedIn ? 'ok' : 'warn') : (st.installing ? 'warn' : 'err'),
           }),
-          h(Metric, { label: '运行状态', value: planTxt, tone: planTone })),
+          h(Metric, { label: '运行状态', value: planTxt, tone: planTone }),
+          /* 点赞 / 收藏今日计数：跟上面三格同一行，关掉的那项不占位。
+           * 数据来自 /likes，口径与历史页那一行完全一致。 */
+          likes ? h(Metric, {
+            label: '点赞',
+            value: `今天 ${Number(likes?.like?.today) || 0} / ${Number(likes?.like?.perDay) || Number(cfg.likePerDay) || 0}`,
+            tone: sw('likeOn') ? ((Number(likes?.like?.today) || 0) > 0 ? 'ok' : undefined) : undefined,
+          }) : null,
+          (likes && sw('favOn')) ? h(Metric, {
+            label: '收藏',
+            value: `今天 ${Number(likes?.fav?.today) || 0} / ${Number(likes?.fav?.perDay) || Number(cfg.favPerDay) || 0}`,
+            tone: (Number(likes?.fav?.today) || 0) > 0 ? 'ok' : undefined,
+          }) : null),
 
         /* ══ ①.5 本轮进度（跑的时候实时刷，跑完留最后一份）══════════════ */
         (st.running || runLog) ? (() => {
@@ -1294,54 +1434,56 @@ window.__ModuleLoader__.load({
         },
           h(SwitchRow, {
             label: '自动运行',
-            desc: '关闭后仅可通过「立即运行一轮」手动触发',
+            hint: '关闭后只能手动跑',
             on: Boolean(autoRun),
             onChange: (v) => { setAutoRun(v); patch({ autoRun: v }, '自动运行') },
           }),
           Boolean(autoRun) ? h('div', { 'data-bd-sub': '' },
-            h(Row, {
-              label: '每天最多几轮',
-              desc: '0 = 不限。建议 6（配合 60 分钟间隔 ≈ 每小时 1 轮）',
-            }, h('input', {
-              'data-bd-input': '', 'data-bd-w-num': '', type: 'number', min: 0, max: 24,
-              value: runsPerDay ?? '',
-              onChange: (e) => setRunsPerDay(e.target.value),
-              onBlur: () => { const n = Math.max(0, Math.min(Number(runsPerDay) || 0, 24)); setRunsPerDay(String(n)); patch({ autoRunsPerDay: n }, '每天最多几轮') },
-            })),
-            h(Row, {
-              label: '两轮间隔',
-              desc: '分钟。默认 60 ⇒ 每小时最多 1 轮',
-            }, h('input', {
-              'data-bd-input': '', 'data-bd-w-num': '', type: 'number', min: 15, max: 240,
-              value: gapMin ?? '',
-              onChange: (e) => setGapMin(e.target.value),
-              onBlur: () => { const n = Math.max(15, Math.min(Number(gapMin) || 60, 240)); setGapMin(String(n)); patch({ autoGapMinutes: n }, '两轮间隔') },
-            }))) : null),
+            h(Pair, {},
+              h(Row, {
+                label: '每天最多几轮',
+                hint: '0 = 不限',
+              }, h('input', {
+                'data-bd-input': '', 'data-bd-w-num': '', type: 'number', min: 0, max: 24,
+                value: runsPerDay ?? '',
+                onChange: (e) => setRunsPerDay(e.target.value),
+                onBlur: () => { const n = Math.max(0, Math.min(Number(runsPerDay) || 0, 24)); setRunsPerDay(String(n)); patch({ autoRunsPerDay: n }, '每天最多几轮') },
+              })),
+              h(Row, {
+                label: '两轮间隔',
+                hint: '分钟 · 默认 60',
+              }, h('input', {
+                'data-bd-input': '', 'data-bd-w-num': '', type: 'number', min: 15, max: 240,
+                value: gapMin ?? '',
+                onChange: (e) => setGapMin(e.target.value),
+                onBlur: () => { const n = Math.max(15, Math.min(Number(gapMin) || 60, 240)); setGapMin(String(n)); patch({ autoGapMinutes: n }, '两轮间隔') },
+              })))) : null),
 
         h(Divider),
 
         h(Card, { title: '每轮与每天上限' },
-          h(Row, {
-            label: '每轮最多挑几条',
-            desc: '一轮里最多挑中几个视频（0 = 只跑不挑）',
-          }, h('input', {
-            'data-bd-input': '', 'data-bd-w-num': '', type: 'number', min: 0, max: 20,
-            value: pickPerRound ?? '',
-            onChange: (e) => setPickPerRound(e.target.value),
-            onBlur: () => { const n = Math.max(0, Math.min(Number(pickPerRound) || 0, 20)); setPickPerRound(String(n)); patch({ perRoundMax: n }, '每轮最多挑几条') },
-          })),
-          h(Row, {
-            label: '每天最多挑几条',
-            desc: '全天上限。默认 18 = 6 轮 × 3 条，调到上限 120 会提示风险',
-          }, h('input', {
-            'data-bd-input': '', 'data-bd-w-num': '', type: 'number', min: 0, max: 120,
-            value: pickPerDay ?? '',
-            onChange: (e) => setPickPerDay(e.target.value),
-            onBlur: () => { const n = Math.max(0, Math.min(Number(pickPerDay) || 0, 120)); setPickPerDay(String(n)); patch({ perDayMax: n }, '每天最多挑几条') },
-          })),
+          h(Pair, {},
+            h(Row, {
+              label: '每轮最多挑几条',
+              hint: '0 = 只跑不挑',
+            }, h('input', {
+              'data-bd-input': '', 'data-bd-w-num': '', type: 'number', min: 0, max: 20,
+              value: pickPerRound ?? '',
+              onChange: (e) => setPickPerRound(e.target.value),
+              onBlur: () => { const n = Math.max(0, Math.min(Number(pickPerRound) || 0, 20)); setPickPerRound(String(n)); patch({ perRoundMax: n }, '每轮最多挑几条') },
+            })),
+            h(Row, {
+              label: '每天最多挑几条',
+              hint: '全天上限',
+            }, h('input', {
+              'data-bd-input': '', 'data-bd-w-num': '', type: 'number', min: 0, max: 120,
+              value: pickPerDay ?? '',
+              onChange: (e) => setPickPerDay(e.target.value),
+              onBlur: () => { const n = Math.max(0, Math.min(Number(pickPerDay) || 0, 120)); setPickPerDay(String(n)); patch({ perDayMax: n }, '每天最多挑几条') },
+            }))),
           h(Row, {
             label: '每天最多转写几次',
-            desc: '熔断：超过就只挑有字幕的视频，不再走本地转写',
+            hint: '超过只挑有字幕的',
           }, h('input', {
             'data-bd-input': '', 'data-bd-w-num': '', type: 'number', min: 0, max: 50,
             value: transCap ?? '',
@@ -1356,7 +1498,7 @@ window.__ModuleLoader__.load({
         h(Card, { title: '内容筛选' },
           h(Row, {
             label: '只看多长的视频',
-            desc: '分钟。0 = 该端不限。长视频转写很慢，建议设上限',
+            hint: '分钟 · 0 = 该端不限',
           }, h('div', { 'data-bd-inline': '' },
             h('input', {
               'data-bd-input': '', 'data-bd-w-num': '', type: 'number', min: 0, max: 600,
@@ -1373,14 +1515,14 @@ window.__ModuleLoader__.load({
             }))),
           h(SwitchRow, {
             label: '字幕优先',
-            desc: '先从候选里挑有字幕的（省掉转写时间）；查完还没有就转写优先级最高的那条',
+            hint: '先挑有字幕的，省掉转写',
             on: Boolean(preferSub),
             onChange: (v) => { setPreferSub(v); patch({ preferSubtitle: v }, '字幕优先') },
           }),
           Boolean(preferSub) ? h('div', { 'data-bd-sub': '' },
             h(Row, {
               label: '最多查几条字幕',
-              desc: '查完这么多还没有字幕，就直接转写优先级最高的那条',
+              hint: '查完就转写优先级最高的那条',
             }, h('input', {
               'data-bd-input': '', 'data-bd-w-num': '', type: 'number', min: 1, max: 10,
               value: probeMax ?? '',
@@ -1411,7 +1553,7 @@ window.__ModuleLoader__.load({
         h(Card, { title: '日报' },
           h(Row, {
             label: '日报详细程度',
-            desc: '完整版报告更长、更费 token；简要版每条一两行',
+            hint: '完整版更长、更费 token',
           }, h('select', {
             'data-bd-select': '', 'data-bd-w-md': '', value: rl ?? 'full',
             onChange: (e) => { setRl(e.target.value); patch({ reportLevel: e.target.value }, '日报详细程度') },
@@ -1452,7 +1594,7 @@ window.__ModuleLoader__.load({
           (sw('autoComment') || sw('circleMode')) ? h('div', { 'data-bd-sub': '' },
             h(Row, {
               label: sw('circleMode') ? '每轮楼中楼上限' : '每轮评论上限',
-              desc: `设为 0 则本轮不发。最多 ${commentCap} 条（跟着「每轮最多挑几条」走）`,
+              hint: `0 = 本轮不发 · 最多 ${commentCap} 条`,
             }, h('input', {
               'data-bd-input': '', 'data-bd-w-num': '', type: 'number', min: 0, max: commentCap,
               value: perRound ?? '',
@@ -1488,7 +1630,7 @@ window.__ModuleLoader__.load({
           sw('replyToComments') ? h('div', { 'data-bd-sub': '' },
             h(Row, {
               label: '每轮回复上限',
-              desc: '仅统计直接回复在本插件评论下的人',
+              hint: '只算回在本插件评论下的',
             }, h('input', {
               'data-bd-input': '', 'data-bd-w-num': '', type: 'number', min: 1, max: 10,
               value: replyPer ?? '',
@@ -1501,7 +1643,7 @@ window.__ModuleLoader__.load({
           /* 私信：跟评论并列的独立开关 */
           h(Row, {
             label: '私信',
-            desc: '另外私信给一个人（公开评论由上面的「评论行为」决定）',
+            hint: '另外私信给一个人',
           }, h(Switch, {
             on: Boolean(dmOn),
             onChange: (v) => { setDmOn(v); patch({ dmOn: v }, '私信') },
@@ -1655,6 +1797,96 @@ window.__ModuleLoader__.load({
             }, guardLogBusy ? '读取中…' : '刷新')),
           h('div', { style: { marginTop: 8 } }, renderGuardLog())) : null,
 
+        /* ══ ⑦.7 点赞与收藏 ══════════════════════════════════════════
+         * 两者都是拿账号表态，默认关；额度按「每轮 / 每天」两级硬顶。
+         * ⚠️ 0 是合法值（= 这一轮 / 今天不做），所以回填用 ?? 而不是 ||，
+         *    失焦钳制也不许把 0 兜底成默认值。 */
+        h(Card, {
+          title: '点赞与收藏',
+          desc: '打开后，它会在挑中的视频里按判据点赞 / 收藏（默认关）',
+        },
+          h(SwitchRow, {
+            label: '点赞',
+            hint: '读内容才决定，写不出理由就不点',
+            on: sw('likeOn'),
+            onChange: (v) => patch({ likeOn: v }, '点赞'),
+          }),
+          sw('likeOn') ? h('div', { 'data-bd-sub': '' },
+            h(Pair, {},
+              h(Row, {
+                label: '每轮最多赞几条',
+                hint: '0 = 这一轮不赞',
+              }, h('input', {
+                'data-bd-input': '', 'data-bd-w-num': '', type: 'number', min: 0, max: 5,
+                value: likePerRound ?? '',
+                onChange: (e) => setLikePerRound(e.target.value),
+                onBlur: () => {
+                  const n = Math.max(0, Math.min(Number(likePerRound) || 0, 5))
+                  setLikePerRound(String(n))
+                  patch({ likePerRound: n }, '每轮点赞上限')
+                },
+              })),
+              h(Row, {
+                label: '每天最多赞几条',
+                hint: '硬顶 10 · 0 = 今天不赞',
+              }, h('input', {
+                'data-bd-input': '', 'data-bd-w-num': '', type: 'number', min: 0, max: 10,
+                value: likePerDay ?? '',
+                onChange: (e) => setLikePerDay(e.target.value),
+                onBlur: () => {
+                  const n = Math.max(0, Math.min(Number(likePerDay) || 0, 10))
+                  setLikePerDay(String(n))
+                  patch({ likePerDay: n }, '每天点赞上限')
+                },
+              }))),
+            h(Row, {
+              label: '判据档位',
+              desc: LIKE_RULE_DESC[likeRule] || LIKE_RULE_DESC.standard,
+            }, h('select', {
+              'data-bd-select': '', 'data-bd-w-md': '', value: likeRule ?? 'standard',
+              onChange: (e) => { setLikeRule(e.target.value); patch({ likeRule: e.target.value }, '点赞判据') },
+            },
+              h('option', { value: 'strict' }, '严格 —— 只赞有实操细节、本周用得上的，宁可不赞'),
+              h('option', { value: 'standard' }, '标准 —— 默认，三条硬证据占两条才赞'),
+              h('option', { value: 'loose' }, '宽松 —— 有点意思就赞，但仍受额度限制'))),
+            h(StackRow, {
+              label: '补充判据（选填）',
+              desc: '最多 300 字。判据时跟上面的档位一起看；留空 = 只用档位',
+            }, h('textarea', {
+              'data-bd-textarea': '', rows: 3, maxLength: 300,
+              placeholder: '你想加的判据，例如：不赞讲 AI 焦虑的视频',
+              value: likeRuleExtra ?? '',
+              onChange: (e) => setLikeRuleExtra(e.target.value),
+              onBlur: () => {
+                const v = String(likeRuleExtra ?? '').slice(0, 300)
+                setLikeRuleExtra(v)
+                patch({ likeRuleExtra: v }, '点赞补充判据')
+              },
+            }))) : null,
+
+          h(Divider),
+
+          h(SwitchRow, {
+            label: '收藏',
+            hint: '以后还会回来看才收',
+            on: sw('favOn'),
+            onChange: (v) => patch({ favOn: v }, '收藏'),
+          }),
+          sw('favOn') ? h('div', { 'data-bd-sub': '' },
+            h(Row, {
+              label: '每天最多收藏几条',
+              hint: '硬顶 8 · 0 = 今天不收藏',
+            }, h('input', {
+              'data-bd-input': '', 'data-bd-w-num': '', type: 'number', min: 0, max: 8,
+              value: favPerDay ?? '',
+              onChange: (e) => setFavPerDay(e.target.value),
+              onBlur: () => {
+                const n = Math.max(0, Math.min(Number(favPerDay) || 0, 8))
+                setFavPerDay(String(n))
+                patch({ favPerDay: n }, '每天收藏上限')
+              },
+            }))) : null),
+
         /* ══ ⑧ 检索与上下文 ════════════════════════════════════════════ */
         h(Card, { title: '检索与上下文', desc: '决定检索范围与采用的设定来源' },
           h(StackRow, {
@@ -1663,7 +1895,15 @@ window.__ModuleLoader__.load({
           }, h('textarea', {
             'data-bd-textarea': '', rows: 4,
             placeholder: '每行一个关键词（留空 = 用内置那 5 组）',
-            value: kws ?? '', onChange: (e) => setKws(e.target.value),
+            value: kws ?? '',
+            onChange: (e) => setKws(e.target.value),
+            /* ⭐ 2026-10-25 用户定：这块不再有「保存」按钮，失焦就存（跟同页其它字段一致）。
+             *    没改动就不发请求，免得点一下别处就多一次 POST。 */
+            onBlur: () => {
+              const list = String(kws ?? '').split('\n').map((s) => s.trim()).filter(Boolean)
+              if (list.join('\n') === (cfg?.keywords || []).join('\n')) return
+              patch({ keywords: list }, '检索关键词')
+            },
           })),
           h(StackRow, {
             label: '工作区路径',
@@ -1682,14 +1922,13 @@ window.__ModuleLoader__.load({
             h('button', {
               'data-bd-btn': '', disabled: busy === 'agents', onClick: onAgentsTemplate,
             }, busy === 'agents' ? '生成中…' : '建模板'))),
-          h('div', { 'data-bd-btns': '' },
-            h('button', { 'data-bd-btn': '', 'data-primary': '', disabled: Boolean(busy) || saving, onClick: onSaveText },
-              saving ? '保存中…' : '保存'),
-            msg ? h('div', {
-              'data-bd-msg': '', 'data-bd-msg-flex': '',
-              'data-good': msgTone === 'good' ? '' : undefined,
-              'data-warn': msgTone === 'warn' ? '' : undefined,
-            }, msg) : null)),
+          /* ⭐ 2026-10-25 用户定：不要「保存」按钮了 —— 关键词、工作区都是失焦即存。
+           *    这一行只留结果提示（建模板之类也会写到这里）。 */
+          msg ? h('div', {
+            'data-bd-msg': '', 'data-bd-msg-flex': '',
+            'data-good': msgTone === 'good' ? '' : undefined,
+            'data-warn': msgTone === 'warn' ? '' : undefined,
+          }, msg) : null),
 
         /* ══ ⑨ 高级设置（可折叠） ═══════════════════════════════════════ */
         h('div', { 'data-bd-card': '', 'data-bd-wide': '' },
@@ -2047,7 +2286,12 @@ window.__ModuleLoader__.load({
       .pond-day > button .m { color:var(--dsw-alias-label-tertiary); font-size:11.5px; }
       .pond-day > button .c { margin-left:auto; color:var(--dsw-alias-label-tertiary); font-size:11.5px; }
       .pond-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(200px,1fr)); gap:11px; padding:2px 0 10px; }
-      .pond-v { border:1px solid var(--dsw-alias-border-l1); border-radius:10px; overflow:hidden; background:var(--dsw-alias-bg-layer-2); }
+      .pond-v { border:1px solid var(--dsw-alias-border-l1); border-radius:10px; overflow:hidden; background:var(--dsw-alias-bg-layer-2); cursor:pointer; transition:border-color .14s ease; }
+      .pond-v:hover { border-color:var(--dsw-alias-border-l2); }
+      /* 已赞角标：跟 .tag / .dur 同一套观感；上膛后再点才真撤销 */
+      .pond-v .liked { position:absolute; left:5px; bottom:5px; border:0; font-family:inherit; font-size:10.5px; line-height:16px; padding:1px 7px; border-radius:999px; background:rgba(37,99,235,.9); color:#fff; cursor:pointer; }
+      .pond-v .liked.arm { background:rgba(210,153,34,.95); }
+      .pond-v .liked[disabled] { opacity:.6; cursor:wait; }
       .pond-v .th { position:relative; aspect-ratio:16/10; background:var(--dsw-alias-bg-layer-1); }
       .pond-v .th img { width:100%; height:100%; object-fit:cover; display:block; }
       .pond-v .dur { position:absolute; right:5px; bottom:5px; background:rgba(0,0,0,.72); color:#fff; font-size:10.5px; padding:1px 5px; border-radius:4px; }
@@ -2099,15 +2343,27 @@ window.__ModuleLoader__.load({
       const [quickBusy, setQuickBusy] = React.useState('')
       const [quickMsg, setQuickMsg] = React.useState(null)
       const [quickCommentMode, setQuickCommentMode] = React.useState(null)
+      const [likes, setLikes] = React.useState(null)     // GET /likes：今日计数 + 明细（角标就靠它）
+      const [undoArm, setUndoArm] = React.useState('')   // 已「上膛」待二次确认的 bvid
+      const [undoBusy, setUndoBusy] = React.useState('')
       const runLock = React.useRef(false)
       const quickLock = React.useRef(false)
 
+      const loadLikes = React.useCallback(async () => {
+        try {
+          const r = await jget('/likes')
+          if (r && r.ok !== false) setLikes(r)
+        } catch { /* 拿不到就下次再问，不炸面板 */ }
+      }, [])
+
+      /* 跟 /pond 一起刷新：跑完一轮后点赞计数和角标都该跟着变，不该等第二次手动刷新 */
       const load = React.useCallback(async () => {
         try {
           const r = await jget('/pond?limit=120')
           if (r && r.ok !== false) { setData(r); setErr('') }
         } catch (e) { setErr(String(e && e.message ? e.message : e)) }
-      }, [])
+        await loadLikes()
+      }, [loadLikes])
 
       const syncRun = React.useCallback(async () => {
         try {
@@ -2225,6 +2481,24 @@ window.__ModuleLoader__.load({
         }
       }
 
+      /* 撤销点赞：第一次点只「上膛」，第二次才真发请求 —— 点一下就撤掉账号上的表态太容易误触 */
+      const onUndoLike = async (bvid) => {
+        if (!bvid || undoBusy) return
+        if (undoArm !== bvid) { setUndoArm(bvid); return }
+        setUndoArm('')
+        setUndoBusy(bvid)
+        try {
+          const r = await jpost('/likes/undo', { bvid, kind: 'like' })
+          if (!r || r.ok === false) setQuickMsg({ text: '撤销失败：' + ((r && r.error) || '未知原因'), tone: 'warn' })
+          else setQuickMsg({ text: '已撤销这条点赞', tone: 'ok' })
+        } catch (e) {
+          setQuickMsg({ text: '撤销失败：' + String(e && e.message ? e.message : e), tone: 'warn' })
+        } finally {
+          setUndoBusy('')
+          await loadLikes()
+        }
+      }
+
       const d = data || {}
       const st = d.stats || { xp: 0, level: 1, step: 200, xpIn: 0, days: 0, items: 0, picked: 0, replies: 0, keywords: [], week: [] }
       const items = d.items || []
@@ -2234,6 +2508,11 @@ window.__ModuleLoader__.load({
       const commentMode = quickCommentMode || savedCommentMode
       const mentionReady = Boolean(qcfg.mentionName || Number(qcfg.mentionUid) > 0)
       const dmReady = Number(qcfg.dmUid) > 0
+      /* 只有 undone:false 的才算「已赞」—— 撤销过的就不再显示角标 */
+      const likedMap = {}
+      for (const it of ((likes && likes.like && likes.like.items) || [])) {
+        if (it && it.bvid && !it.undone) likedMap[it.bvid] = it
+      }
     const fmtTok = (n) => n >= 1e6 ? (n / 1e6).toFixed(2) + 'M' : n >= 1e3 ? (n / 1e3).toFixed(1) + 'k' : String(n || 0)
       const kws = [{ k: '全部', n: items.length }].concat(st.keywords || [])
       const kwOf = (e) => (e.keywords && e.keywords.length ? e.keywords : ['未标'])
@@ -2272,22 +2551,44 @@ window.__ModuleLoader__.load({
       })
       const donutBg = donutStops.length ? `conic-gradient(${donutStops.join(',')})` : 'var(--dsw-alias-bg-layer-2)'
 
-      const card = (e) => h('article', { key: e.date + '|' + e.bvid, className: 'pond-v' }, [
-        h('div', { key: 'th', className: 'th' }, [
-          e.pic ? h('img', { key: 'img', src: e.pic + '@480w_300h_1c.webp', alt: '', referrerPolicy: 'no-referrer', loading: 'lazy' }) : null,
-          e.duration ? h('span', { key: 'd', className: 'dur' }, pondMmss(e.duration)) : null,
-          h('span', {
-            key: 't', className: 'tag' + (e.picked ? ' p' : ''),
-            title: e.picked ? '已归档' : '跳过 · ' + (e.skipReason || '其他'),
-          }, e.picked ? '已归档' + (e.replyCount ? ' · 回过 ' + e.replyCount : '') : '跳过 · ' + (e.skipReason || '其他')),
-        ]),
-        h('h3', { key: 'h', title: e.title || e.bvid }, e.title || e.bvid),
-        h('p', { key: 'm' }, [
-          h('span', { key: 'u' }, e.owner || '—'),
-          h('span', { key: 'd' }, String(e.date || '').slice(5).replace('-', '/')),
-          e.views ? h('span', { key: 'v' }, (Number(e.views) / 10000).toFixed(1) + '万') : null,
-        ]),
-      ])
+      /* 封面墙 / 历史卡：点卡片 = 用系统默认浏览器打开这条视频（桌面宿主只接 target=_blank 的 https）。
+       * ⚠️ 点开 ≠ 表态：这里不调任何点赞接口。 */
+      const card = (e) => {
+        const lk = likedMap[e.bvid]
+        const armed = undoArm === e.bvid
+        return h('article', {
+          key: e.date + '|' + e.bvid,
+          className: 'pond-v',
+          title: '点击用默认浏览器打开这条视频',
+          onClick: () => {
+            window.open('https://www.bilibili.com/video/' + e.bvid, '_blank', 'noopener,noreferrer')
+          },
+        }, [
+          h('div', { key: 'th', className: 'th' }, [
+            e.pic ? h('img', { key: 'img', src: e.pic + '@480w_300h_1c.webp', alt: '', referrerPolicy: 'no-referrer', loading: 'lazy' }) : null,
+            e.duration ? h('span', { key: 'd', className: 'dur' }, pondMmss(e.duration)) : null,
+            h('span', {
+              key: 't', className: 'tag' + (e.picked ? ' p' : ''),
+              title: e.picked ? '已归档' : '跳过 · ' + (e.skipReason || '其他'),
+            }, e.picked ? '已归档' + (e.replyCount ? ' · 回过 ' + e.replyCount : '') : '跳过 · ' + (e.skipReason || '其他')),
+            /* 已赞角标：点一下「上膛」，再点一下才真撤销；鼠标移开就撤掉上膛态 */
+            lk ? h('button', {
+              key: 'lk', type: 'button',
+              className: 'liked' + (armed ? ' arm' : ''),
+              disabled: undoBusy === e.bvid,
+              title: armed ? '再点一次就撤销这条点赞' : '这条点过赞，点这里可以撤销',
+              onClick: (ev) => { ev.stopPropagation(); onUndoLike(e.bvid) },
+              onMouseLeave: () => { if (armed) setUndoArm('') },
+            }, armed ? '撤销？' : '已赞 ✓') : null,
+          ]),
+          h('h3', { key: 'h', title: e.title || e.bvid }, e.title || e.bvid),
+          h('p', { key: 'm' }, [
+            h('span', { key: 'u' }, e.owner || '—'),
+            h('span', { key: 'd' }, String(e.date || '').slice(5).replace('-', '/')),
+            e.views ? h('span', { key: 'v' }, (Number(e.views) / 10000).toFixed(1) + '万') : null,
+          ]),
+        ])
+      }
 
       const dayGroups = groups.map((grp) => {
         const open = fold[grp.g] === undefined ? grp.g === firstOpen : !!fold[grp.g]
@@ -2381,6 +2682,13 @@ window.__ModuleLoader__.load({
               key: 'c' + i, className: 'pond-chip' + (kw === x.k ? ' on' : ''),
               onClick: () => setKw(x.k),
             }, x.k + ' ' + x.n))),
+            /* 今日表态小统计：跟卡片角标同一份 /likes 数据；收藏没开且今天没收藏过就不显示 */
+            likes ? h('div', { key: 'lk', className: 'pond-quick-stats', style: { marginTop: 8 } }, [
+              h('span', { key: 'a' }, ['今天已赞 ', h('b', null, String(Number(likes?.like?.today) || 0) + '/' + String(Number(likes?.like?.perDay) || 0))]),
+              (qcfg.favOn || (Number(likes?.fav?.today) || 0) > 0)
+                ? h('span', { key: 'b' }, ['已收藏 ', h('b', null, String(Number(likes?.fav?.today) || 0) + '/' + String(Number(likes?.fav?.perDay) || 0))])
+                : null,
+            ]) : null,
           ]),
           h('div', { key: 'days', className: 'pond-card', style: { paddingTop: 4 } }, dayGroups.length ? dayGroups : h('div', { className: 'pond-empty' }, '还没有历史记录。跑一轮值班，这里就会出现封面墙。')),
         ]),
@@ -2542,7 +2850,7 @@ window.__ModuleLoader__.load({
         if (!slots) return
         slots.inject('settings.section', () => slots.register(
           { name: 'settings.section', id: 'bili-pond', order: 30, label: 'B站鱼塘' },
-          () => h(Panel, { layout: 'settings' }),
+          () => h(Panel, { layout: 'summary' }),
         ))
 
         /* ⭐ 2026-10-23 整页入口：只保留左上侧栏图标（id 与 main key 相同） */
