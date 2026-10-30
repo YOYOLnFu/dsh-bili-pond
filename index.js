@@ -1699,6 +1699,40 @@ const pondAccount = async () => {
   }
 
   /**
+   * ⭐ 2026-10-29：设置页没选线路时，跟随**宿主自己**的 `agent-default-model`。
+   *   起因（用户实测报错）：桌面版是账号登录（provider `deepseek-account`），而 headless
+   *   bundle 自带的默认线路是 `deepseek-official`（API Key 那条）⇒ 本机没存
+   *   `DEEPSEEK_API_KEY` 时，那一轮必然死在 `MISSING_CREDENTIAL`；更糟的是界面上
+   *   被误报成「B站 没登录」，用户反复扫码也不会有用。
+   *   ⚠️ 只认 `agent-default-model` 这一块，其它 entry 一概不碰；
+   *   ⚠️ 宿主里没这条、或 provider/model 不齐 ⇒ 返回 []，照旧跟随 headless 默认模型
+   *      （沿用「抄不到就静默跳过」的原则，绝不硬写半条无效配置）。
+   */
+  const hostDefaultModelYml = () => {
+    const f = hostPatchFile()
+    if (!f) return []
+    let text = ''
+    try { text = readFileSync(f, 'utf8') } catch { return [] }
+    if (!text.trim()) return []
+    const unquote = (s) => String(s).trim().replace(/^['"]|['"]$/g, '')
+    for (const b of splitPatchBlocks(text)) {
+      if (b.id !== 'agent-default-model') continue
+      const body = b.lines.join('\n')
+      if (/^\s*disabled:\s*true/m.test(body)) return []     // 宿主那边本来就关着，别硬打开
+      const pick = (key) => {
+        const m = new RegExp('^[ \\t]+' + key + ':[ \\t]*(.+?)[ \\t]*(?:#.*)?$', 'm').exec(body)
+        return m ? unquote(m[1]) : ''
+      }
+      const prov = pick('provider')
+      const model = pick('model')
+      if (!prov || !model) return []
+      log(`没选模型线路 —— 跟随宿主的默认模型：${prov} / ${model}`)
+      return ['- id: agent-default-model', '  config:', '    provider: ' + prov, '    model: ' + model]
+    }
+    return []
+  }
+
+  /**
    * 把「宿主线路」那几行单独写成一个 overlay 文件，给"探测"用（探完就删）。
    * 返回路径；没有内容就返回空串（调用方照旧跑不带 patch 的探测）。
    */
@@ -1736,8 +1770,9 @@ const pondAccount = async () => {
       `    root: '${posix(join(stateDir, 'headless-sessions'))}'`,
       '',
     )
-    // ⭐ 模型线路（设置页选的）。空 = 不覆盖，跟随 headless 自己的默认模型。
-    const modelYml = modelOverrideYml()
+    // ⭐ 模型线路（设置页选的）。空 = 跟随宿主的默认模型；宿主也没有才跟随 headless 自己的默认模型。
+    let modelYml = modelOverrideYml()
+    if (!modelYml.length) modelYml = hostDefaultModelYml()
     if (modelYml.length) yml.push(...modelYml, '')
     // ⭐ 把界面里在用的模型线路一起带过去（见上面 routeOverlayYml 的注释）
     const routeYml = routeOverlayYml()
@@ -1864,10 +1899,10 @@ const pondAccount = async () => {
     if (code === 0 && !has(/报告|out\/|###\s*BV/i) && tookSec < 20) {
       return { code: 'too_fast', hint: '开跑几秒就以成功退出，但没写报告 —— 多半是 dsh 或模型线路没配好（可点「连通性检测」）' }
     }
-    if (has(/NO_ADAPTER|ACCOUNT_SIGN_IN_REQUIRED|401|403/)) {
-      return { code: 'model', hint: '模型线路没通（凭据/线路名不对）—— 到「高级设置 → 运行模型线路」重新选一条' }
+    if (has(/MISSING_CREDENTIAL|NO_ADAPTER|ACCOUNT_SIGN_IN_REQUIRED|401|403/)) {
+      return { code: 'model', hint: '模型线路没通（缺凭据 / 线路名不对）—— 到「高级设置 → 运行模型线路」重新选一条；headless 用的线路和你正在用的不是同一条时也会这样' }
     }
-    if (has(/MISSING_CREDENTIAL|未登录|401/)) {
+    if (has(/未登录|登录失效|凭证失效/)) {
       return { code: 'login', hint: 'B站 没登录或凭证失效 —— 点「扫码登录」重扫一次' }
     }
     if (has(/ETIMEDOUT|ENOTFOUND|ECONNRESET|fetch failed/i)) {
