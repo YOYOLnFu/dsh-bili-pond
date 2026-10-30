@@ -1,5 +1,17 @@
 # 更新日志
 
+## 1.3.14（2026-10-30）
+
+- **值班轮跟随宿主的默认模型**（社区 PR #1，作者 [@Wine90](https://github.com/Wine90)，本机逐条复核后合并）：
+  桌面版是账号登录（provider `deepseek-account`），而 headless bundle 自带的默认线路是 `deepseek-official`
+  （API Key 那条）—— 本机没存 `DEEPSEEK_API_KEY` 时，那一轮必然死在 `MISSING_CREDENTIAL`。现在设置页
+  没选线路时，抄宿主 `agent-default-model` 的 provider / model 进 overlay；宿主没这条、只写了一半、
+  或本来就 `disabled: true` ⇒ 一行都不写，照旧跟随 headless 默认模型（绝不硬写半条无效配置）。
+- **失败归类修正**：`MISSING_CREDENTIAL` 以前会先撞上「B站 没登录」那条 ⇒ 界面让人反复扫码也没有用。
+  现在「模型线路」分支排在「登录」分支前面，并单独认出 B站 自己的「未登录 / 登录失效 / 凭证失效」。
+- **补回归**：新增 `tools/test-host-default-model.mjs`（37 条断言，把真源码切出来在临时宿主上跑），
+  覆盖抄写、半条配置、`disabled`、引号与注释、失败归类顺序、接线；已挂进 `npm run check`。
+
 ## 1.3.13（2026-10-25）
 
 - **点赞与收藏**：新增 `bili_like` / `bili_fav` 两只工具，用宿主的登录态真的点出去（撤销也是真请求）。
